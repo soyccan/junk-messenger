@@ -6,6 +6,9 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <poll.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -37,11 +40,15 @@ static inline int sock_set_non_blocking(int fd)
 
 struct HTTPServer {
     int listen_fd;
-    bool to_shutdown;
-    std::list<HTTPRequest> request_list;
+    pthread_t listen_thread;
 
-    const static size_t NUM_POLL_FD = 1024;
-    fd_set poll_fds;
+    bool to_shutdown;
+    sem_t is_shutdown;
+
+    std::list<HTTPRequest> request_list;
+    std::list<HTTPRequest *> zombie_queue;
+    pthread_mutex_t zombie_lock;
+    pthread_cond_t zombie_cond;
 
     HTTPServer(in_port_t port = 80, std::string addr = "127.0.0.1")
         : to_shutdown(false)
@@ -67,53 +74,55 @@ struct HTTPServer {
         G(bind(this->listen_fd, (struct sockaddr *) &bind_addr,
                sizeof(bind_addr)));
         G(listen(this->listen_fd, SOMAXCONN));
-        G(sock_set_non_blocking(this->listen_fd));
+        // G(sock_set_non_blocking(this->listen_fd));
 
-        FD_ZERO(&this->poll_fds);
-        FD_SET(this->listen_fd, &this->poll_fds);
+        G(sem_init(&this->is_shutdown, 0, 0));
+        G(pthread_mutex_init(&this->zombie_lock, NULL));
+        G(pthread_cond_init(&this->zombie_cond, NULL));
     }
 
-    ~HTTPServer()
+    static void *listen_thread_loop(void *self_)
     {
-        log_info("closing socket");
-        G(::shutdown(this->listen_fd, SHUT_RDWR));
+        HTTPServer *self = (HTTPServer *) self_;
+        while (!self->to_shutdown) {
+            self->accept_request();
+        }
+        // G(sem_post(&self->is_shutdown));
+        return NULL;
     }
 
     void serve_forever()
     {
-        while (!this->to_shutdown) {
-            log_debug("select");
-
-            fd_set fdr, fde;  // fdset for read and exception
-            memcpy(&fdr, &this->poll_fds, sizeof(fdr));
-            memcpy(&fde, &this->poll_fds, sizeof(fde));
-            struct timeval t;
-            t.tv_sec = 0;
-            t.tv_usec = 500000;
-            int n_ready = select(1024, &fdr, NULL, &fde, &t);
-
-            // if (this->to_shutdown)
-            //     break;
-
-            for (int i = 0; i < 1024; i++) {
-                if (FD_ISSET(i, &fde)) {
-                    // socket is closed
-                    // TODO: other exception than closed socket?
-                    this->close_request(i);
-                } else if (FD_ISSET(i, &fdr)) {
-                    if (i == this->listen_fd) {
-                        // one or more incoming connections
-                        do {
-                        } while (this->accept_request() > 0);
-                    } else {
-                        this->handle_request_noblock(i);
-                    }
-                }
-            }
+        int ret;
+        ret = pthread_create(&this->listen_thread, NULL,
+                             this->listen_thread_loop, this);
+        if (ret < 0) {
+            log_err("pthread_create");
+            return;
         }
+
+        while (!this->to_shutdown) {
+            pthread_mutex_lock(&this->zombie_lock);
+            while (this->zombie_queue.empty()) {
+                pthread_cond_wait(&this->zombie_cond, &this->zombie_lock);
+            }
+            pthread_mutex_unlock(&this->zombie_lock);
+        }
+
+        G(pthread_join(this->listen_thread, NULL));
     }
 
-    void shutdown() { this->to_shutdown = true; }
+    void shutdown()
+    {
+        this->to_shutdown = true;
+
+        log_info("Waiting thread to terminate");
+        pthread_kill(this->listen_thread, SIGINT);
+        // G(sem_wait(&this->is_shutdown));
+
+        log_info("Closing socket");
+        G(::shutdown(this->listen_fd, SHUT_RDWR));
+    }
 
     /* Called after select() so that this is nonblocking
      * Return: 0 if there is no more connection
@@ -144,34 +153,36 @@ struct HTTPServer {
         // TODO: non-blockng IO
         // G(sock_set_non_blocking(in_fd));
 
-        FD_SET(in_fd, &this->poll_fds);
+        this->request_list.emplace_back(in_fd, &this->zombie_queue,
+                                        &this->zombie_lock, &this->zombie_cond);
+        auto &request = this->request_list.back();
+        request.handle();
 
-        this->request_list.emplace_back(in_fd);
         return 1;
     }
 
-    void close_request(int fd)
-    {
-        for (auto r = this->request_list.begin(); r != this->request_list.end();
-             r++) {
-            if (r->client_fd == fd) {
-                FD_CLR(fd, &this->poll_fds);
-                this->request_list.erase(r);
-                break;
-            }
-        }
-    }
-
-    int handle_request_noblock(int fd)
-    {
-        for (HTTPRequest &r : this->request_list) {
-            if (r.client_fd == fd) {
-                r.handle();
-                break;
-            }
-        }
-        return 0;
-    }
+    // void close_request(int fd)
+    // {
+    //     for (auto r = this->request_list.begin(); r !=
+    //     this->request_list.end();
+    //          r++) {
+    //         if (r->client_fd == fd) {
+    //             this->request_list.erase(r);
+    //             break;
+    //         }
+    //     }
+    // }
+    //
+    // int handle_request_noblock(int fd)
+    // {
+    //     for (HTTPRequest &r : this->request_list) {
+    //         if (r.client_fd == fd) {
+    //             r.handle();
+    //             break;
+    //         }
+    //     }
+    //     return 0;
+    // }
 };
 
 #endif

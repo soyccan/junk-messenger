@@ -48,6 +48,11 @@ struct HTTPRequest {
     FILE *client_fs;
     int client_fd;
     bool to_close_conn;
+    pthread_t thread;
+
+    std::list<HTTPRequest *> *zombie_queue;
+    pthread_mutex_t *zombie_lock;
+    pthread_cond_t *zombie_cond;
 
     // ring buffer
     char buf[MAX_BUF_SIZE];
@@ -59,15 +64,22 @@ struct HTTPRequest {
     std::string query_str;
 
     // headers
-    struct HTTPRequestHeader {
-        void *key_start, *key_end;
-        void *value_start, *value_end;
-    };
-    std::list<HTTPRequestHeader> header_list;
+    // struct HTTPRequestHeader {
+    //     void *key_start, *key_end;
+    //     void *value_start, *value_end;
+    // };
+    // std::list<HTTPRequestHeader> header_list;
 
-    HTTPRequest(int client_fd)
-        : client_fd(client_fd),
+    HTTPRequest(int client_fd,
+                std::list<HTTPRequest *> *zombie_queue,
+                pthread_mutex_t *zombie_lock,
+                pthread_cond_t *zombie_cond)
+        : client_fs(NULL),
+          client_fd(client_fd),
           to_close_conn(false),
+          zombie_queue(zombie_queue),
+          zombie_lock(zombie_lock),
+          zombie_cond(zombie_cond),
           http_major(0),
           http_minor(0)
     {
@@ -75,9 +87,20 @@ struct HTTPRequest {
         if (!this->client_fs) {
             log_err("fdopen(client_fd)");
         }
+
+        method[0] = '\0';
+
+        G(pthread_create(&this->thread, NULL, this->thread_routine, this));
     }
 
-    ~HTTPRequest() { this->close_conn(); }
+    ~HTTPRequest() { this->terminate(); }
+
+    static void *thread_routine(void *self_)
+    {
+        HTTPRequest *self = (HTTPRequest *) self_;
+        self->handle();
+        return NULL;
+    }
 
     void handle()
     {
@@ -87,6 +110,8 @@ struct HTTPRequest {
         // if Keep-Alive is received
         // while (!this->to_close_conn)
         //     this->handle_one_request();
+
+        this->terminate();
     }
 
     void close_conn()
@@ -96,8 +121,7 @@ struct HTTPRequest {
 
         log_info("Closing connection fd=%d", client_fd);
 
-        // use shutdown instead of close
-        // will cause all blocking call on this socket to return
+        // TODO: shutdown vs. close
         G(shutdown(this->client_fd, SHUT_RDWR));
         // G(close(this->client_fd));
 
@@ -106,6 +130,16 @@ struct HTTPRequest {
         }
         this->client_fd = -1;
         this->client_fs = NULL;
+    }
+
+    void terminate()
+    {
+        this->close_conn();
+
+        pthread_mutex_lock(this->zombie_lock);
+        this->zombie_queue->push_back(this);
+        pthread_cond_signal(this->zombie_cond);
+        pthread_mutex_unlock(this->zombie_lock);
     }
 
     void handle_one_request()
@@ -238,10 +272,6 @@ struct HTTPRequest {
 
     void do_GET()
     {
-        size_t cont_len = 0;
-        int status_code = 200;
-        char *cont = NULL;
-
         if (query_str[0] == '/') {
             FILE *obj = fopen(this->query_str.c_str() + 1, "r");
 
@@ -250,8 +280,10 @@ struct HTTPRequest {
             if (!obj) {
                 log_err("File not found");
                 this->response_error(404);
-                return;
             } else {
+                size_t cont_len = 0;
+                char *cont = NULL;
+
                 fseek(obj, 0, SEEK_END);
                 long sz = ftell(obj);
 
@@ -265,13 +297,15 @@ struct HTTPRequest {
                 cont_len = sz;
 
                 fclose(obj);
+
+                this->response(200, cont, cont_len);
+
+                if (cont)
+                    delete[] cont;
             }
+        } else {
+            this->response_error(404);
         }
-
-        this->response(status_code, cont, cont_len);
-
-        if (cont)
-            delete[] cont;
     }
 
     void response(int status_code, const char *content, size_t content_len = 0)
@@ -297,7 +331,7 @@ struct HTTPRequest {
         fprintf(this->client_fs, "Connection: Close\r\n");
         fprintf(this->client_fs, "\r\n");
         fwrite(content, 1, content_len, this->client_fs);
-        // G(fflush(this->client_fs));
+        G(fflush(this->client_fs));
 
         this->to_close_conn = true;
     }

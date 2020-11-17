@@ -49,4 +49,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # target_compile_options
 
 add_executable(junk-messenger src/main.cpp)
+target_compile_options(junk-messenger PRIVATE "-pthread")
+target_link_libraries(junk-messenger PRIVATE "pthread")
 # target_include_directories(junk-messenger PRIVATE "${LIBAVL}")
