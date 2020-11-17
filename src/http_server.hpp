@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -36,8 +37,11 @@ static inline int sock_set_non_blocking(int fd)
 
 struct HTTPServer {
     int listen_fd;
-
     bool to_shutdown;
+    std::list<HTTPRequest> request_list;
+
+    const static size_t NUM_POLL_FD = 1024;
+    fd_set poll_fds;
 
     HTTPServer(in_port_t port = 80, std::string addr = "127.0.0.1")
         : to_shutdown(false)
@@ -64,6 +68,9 @@ struct HTTPServer {
                sizeof(bind_addr)));
         G(listen(this->listen_fd, SOMAXCONN));
         G(sock_set_non_blocking(this->listen_fd));
+
+        FD_ZERO(&this->poll_fds);
+        FD_SET(this->listen_fd, &this->poll_fds);
     }
 
     ~HTTPServer()
@@ -75,20 +82,33 @@ struct HTTPServer {
     void serve_forever()
     {
         while (!this->to_shutdown) {
-            struct pollfd poll_fds[] = {
-                {.fd = this->listen_fd, .events = POLLIN, .revents = 0}};
+            log_debug("select");
 
-            int n_ready = poll(poll_fds, 1, 500);
-            // assert(n_ready >= 0 && "poll");
+            fd_set fdr, fde;  // fdset for read and exception
+            memcpy(&fdr, &this->poll_fds, sizeof(fdr));
+            memcpy(&fde, &this->poll_fds, sizeof(fde));
+            struct timeval t;
+            t.tv_sec = 0;
+            t.tv_usec = 500000;
+            int n_ready = select(1024, &fdr, NULL, &fde, &t);
 
-            if (this->to_shutdown)
-                break;
+            // if (this->to_shutdown)
+            //     break;
 
-            // if (poll_fds[0].revents & POLLIN) {
-            if (n_ready > 0) {
-                // one or more incoming connections
-                do {
-                } while (this->handle_request_noblock() > 0);
+            for (int i = 0; i < 1024; i++) {
+                if (FD_ISSET(i, &fde)) {
+                    // socket is closed
+                    // TODO: other exception than closed socket?
+                    this->close_request(i);
+                } else if (FD_ISSET(i, &fdr)) {
+                    if (i == this->listen_fd) {
+                        // one or more incoming connections
+                        do {
+                        } while (this->accept_request() > 0);
+                    } else {
+                        this->handle_request_noblock(i);
+                    }
+                }
             }
         }
     }
@@ -100,7 +120,7 @@ struct HTTPServer {
      *         1 if a connection is successfully accepted
      *         -1 on error
      */
-    int handle_request_noblock()
+    int accept_request()
     {
         struct sockaddr_in in_addr = {0};
         socklen_t in_addr_len = 0;
@@ -124,9 +144,33 @@ struct HTTPServer {
         // TODO: non-blockng IO
         // G(sock_set_non_blocking(in_fd));
 
-        HTTPRequest request(in_fd);
-        request.handle();
+        FD_SET(in_fd, &this->poll_fds);
+
+        this->request_list.emplace_back(in_fd);
         return 1;
+    }
+
+    void close_request(int fd)
+    {
+        for (auto r = this->request_list.begin(); r != this->request_list.end();
+             r++) {
+            if (r->client_fd == fd) {
+                FD_CLR(fd, &this->poll_fds);
+                this->request_list.erase(r);
+                break;
+            }
+        }
+    }
+
+    int handle_request_noblock(int fd)
+    {
+        for (HTTPRequest &r : this->request_list) {
+            if (r.client_fd == fd) {
+                r.handle();
+                break;
+            }
+        }
+        return 0;
     }
 };
 

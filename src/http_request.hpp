@@ -47,7 +47,7 @@ struct HTTPRequest {
 
     FILE *client_fs;
     int client_fd;
-    bool close_connection;
+    bool to_close_conn;
 
     // ring buffer
     char buf[MAX_BUF_SIZE];
@@ -67,7 +67,7 @@ struct HTTPRequest {
 
     HTTPRequest(int client_fd)
         : client_fd(client_fd),
-          close_connection(false),
+          to_close_conn(false),
           http_major(0),
           http_minor(0)
     {
@@ -77,21 +77,29 @@ struct HTTPRequest {
         }
     }
 
+    ~HTTPRequest() { this->close_conn(); }
+
     void handle()
     {
-        this->close_connection = true;
+        this->to_close_conn = true;
         this->handle_one_request();
 
         // if Keep-Alive is received
-        while (!this->close_connection)
-            this->handle_one_request();
+        // while (!this->to_close_conn)
+        //     this->handle_one_request();
+    }
+
+    void close_conn()
+    {
+        if (client_fd < 0)
+            return;
 
         log_info("Closing connection fd=%d", client_fd);
 
         // use shutdown instead of close
         // will cause all blocking call on this socket to return
         G(shutdown(this->client_fd, SHUT_RDWR));
-        G(close(this->client_fd));
+        // G(close(this->client_fd));
 
         if (this->client_fs) {
             G(fclose(this->client_fs));
@@ -112,14 +120,14 @@ struct HTTPRequest {
         //
         //     if (nr == 0) {
         //         // EOF
-        //         this->close_connection = true;
+        //         this->to_close_conn = true;
         //         break;
         //     }
         //
         //     if (nr < 0) {
         //         if (errno != EAGAIN && errno != EWOULDBLOCK) {
         //             log_err("recv error");
-        //             this->close_connection = true;
+        //             this->to_close_conn = true;
         //         }
         //         break;
         //     }
@@ -136,7 +144,7 @@ struct HTTPRequest {
         //         continue;
         //     } else if (ret != 0) {
         //         // error
-        //         this->close_connection = true;
+        //         this->to_close_conn = true;
         //         break;
         //     }
         //
@@ -146,7 +154,7 @@ struct HTTPRequest {
         //         continue;
         //     } else if (ret != 0) {
         //         // error
-        //         this->close_connection = true;
+        //         this->to_close_conn = true;
         //         break;
         //     }
         //
@@ -157,8 +165,12 @@ struct HTTPRequest {
 
         int ret;
         ret = this->parse_request_line();
-        if (ret != 0) {
+        if (ret == EINVAL) {
+            // Bad Request
             this->response_error(400);
+            return;
+        } else if (ret != 0) {
+            this->to_close_conn = true;
             return;
         }
 
@@ -171,7 +183,8 @@ struct HTTPRequest {
     {
         // TODO: what if MAX_REQUEST_LINE_LEN is reached
         if (fgets(this->buf, MAX_BUF_SIZE, this->client_fs) == NULL) {
-            return -1;
+            log_err("fgets");
+            return errno;
         }
 
         char *reqline = this->buf;
@@ -184,7 +197,7 @@ struct HTTPRequest {
         if (!method || !query_str || !http_version ||
             !streq32(http_version, 'H', 'T', 'T', 'P') ||
             http_version[4] != '/' || http_version[6] != '.') {
-            return -1;
+            return EINVAL;
         }
 
         this->http_major = http_version[5] - '0';
@@ -283,10 +296,10 @@ struct HTTPRequest {
         fprintf(this->client_fs, "Content-Length: %lu\r\n", content_len);
         fprintf(this->client_fs, "Connection: Close\r\n");
         fprintf(this->client_fs, "\r\n");
-        if (content && content_len > 0) {
-            fwrite(content, 1, content_len, this->client_fs);
-        }
-        G(fflush(this->client_fs));
+        fwrite(content, 1, content_len, this->client_fs);
+        // G(fflush(this->client_fs));
+
+        this->to_close_conn = true;
     }
 
     void response_error(int status_code)
