@@ -9,25 +9,40 @@
 #include <assert.h>
 #include <stdio.h>
 
+#include "http_request.hpp"
+#include "http_server.hpp"
 #include "logging.h"
+
+
+#define ADDR "0.0.0.0"
+#define PORT 8081
+
+HTTPServer server(PORT, ADDR);
+
+void on_sigint(int signo)
+{
+    server.shutdown();
+}
 
 int main()
 {
     /* when a fd is closed by remote, writing to this fd will cause system
      * send SIGPIPE to this process, which exit the program
      */
-    if (sigaction(SIGPIPE,
-                  &(struct sigaction){.sa_handler = SIG_IGN, .sa_flags = 0},
-                  NULL)) {
+    struct sigaction act = {0};
+    act.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &act, NULL)) {
         log_err("Failed to install signal handler for SIGPIPE");
         return 0;
     }
 
-    int ret = 0;
-    int listen_fd = open_listen_socket(PORT);
+    act.sa_handler = on_sigint;
+    if (sigaction(SIGINT, &act, NULL)) {
+        log_err("Failed to install signal handler for SIGINT");
+        return 0;
+    }
 
-    log_info("Web server started");
-
+    server.serve_forever();
 
     return 0;
 }

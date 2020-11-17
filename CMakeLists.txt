@@ -48,5 +48,5 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # target_compile_definitions
 # target_compile_options
 
-add_executable(junk-messenger src/main.c)
+add_executable(junk-messenger src/main.cpp)
 # target_include_directories(junk-messenger PRIVATE "${LIBAVL}")

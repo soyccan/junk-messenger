@@ -1,0 +1,6 @@
+- Bind address "Resource in use" problem
+  Currently use REUSEADDR to solve, but this is not good solution
+
+- Browsers assumed Keep-Alive connection and will create 2 sockets
+  The first contains HTTP request and will be closed after finishing handling
+  but the second will send nothing so we will be blocked on read()

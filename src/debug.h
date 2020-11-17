@@ -4,9 +4,9 @@
 #include "logging.h"
 
 // guard system call error
-#define G(expr)                          \
-    if ((expr) < 0) {                    \
-        log_debug(LOG_COLOR_RED(#expr)); \
+#define G(expr)         \
+    if ((expr) < 0) {   \
+        log_err(#expr); \
     }
 
 #endif
