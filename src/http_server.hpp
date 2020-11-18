@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 
 #include <assert.h>
@@ -36,8 +37,12 @@ static inline int sock_set_non_blocking(int fd)
 }
 
 struct HTTPServer {
+    const static size_t TIMEOUT_DEFAULT_MSEC = 10000;
+
     int listen_fd;
     bool to_shutdown;
+
+    std::list<HTTPRequest *> request_list;
 
     int epoll_fd;
 
@@ -90,6 +95,29 @@ struct HTTPServer {
 
             int n_event = epoll_wait(this->epoll_fd, events, MAX_EVENT, -1);
 
+            // shutdown no-response client
+            struct timeval tv;
+            int rc = gettimeofday(&tv, NULL);
+            assert(rc == 0 && "time_update: gettimeofday error");
+            size_t current_msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            bool keep_remove = true;
+            while (keep_remove) {
+                keep_remove = false;
+                for (HTTPRequest *r : this->request_list) {
+                    if (current_msec - r->recent_used_msec >
+                        TIMEOUT_DEFAULT_MSEC) {
+                        log_debug(
+                            "remove timed out request fd=%d "
+                            "recent_used_msec=%lu current_msec=%lu",
+                            r->client_fd, r->recent_used_msec, current_msec);
+                        this->request_list.remove(r);
+                        delete r;
+                        keep_remove = true;
+                        break;
+                    }
+                }
+            }
+
             if (n_event < 0) {
                 log_err("epoll_wait");
                 continue;
@@ -114,6 +142,11 @@ struct HTTPServer {
                         log_err("epoll error fd: %d", rq->client_fd);
                         G(epoll_ctl(this->epoll_fd, EPOLL_CTL_DEL,
                                     rq->client_fd, ev));
+                        for (HTTPRequest *r : this->request_list) {
+                            if (r == rq) {
+                                this->request_list.remove(r);
+                            }
+                        }
                         delete rq;
                     } else {
                         ((HTTPRequest *) ev->data.ptr)->handle();
@@ -167,6 +200,7 @@ struct HTTPServer {
         ev.data.ptr = rq;
         ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
         G(epoll_ctl(this->epoll_fd, EPOLL_CTL_ADD, in_fd, &ev));
+        this->request_list.push_back(rq);
 
         return 1;
     }

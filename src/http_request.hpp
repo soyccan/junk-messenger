@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -48,6 +49,7 @@ struct HTTPRequest {
     FILE *client_read, *client_write;
     int client_fd;
     bool to_close_conn;
+    size_t recent_used_msec;
 
     // ring buffer
     char buf[MAX_BUF_SIZE];
@@ -57,6 +59,10 @@ struct HTTPRequest {
     int http_major, http_minor;
     char method[8];
     std::string query_str;
+
+    // state
+    enum State { STATE_BEGIN, STATE_REQ_LINE, STATE_REQ_HDR };
+    State state;
 
     // headers
     // struct HTTPRequestHeader {
@@ -69,7 +75,8 @@ struct HTTPRequest {
         : client_fd(client_fd),
           to_close_conn(false),
           http_major(0),
-          http_minor(0)
+          http_minor(0),
+          state(STATE_BEGIN)
     {
         if (file_stream) {
             this->client_read = fdopen(client_fd, "rb");
@@ -84,20 +91,29 @@ struct HTTPRequest {
             this->client_read = NULL;
             this->client_write = NULL;
         }
+
+        this->update_time();
     }
 
     ~HTTPRequest() { this->terminate(); }
 
+    void update_time()
+    {
+        struct timeval tv;
+        int rc = gettimeofday(&tv, NULL);
+        assert(rc == 0 && "time_update: gettimeofday error");
+        this->recent_used_msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    }
+
     void handle()
     {
+        this->update_time();
         this->to_close_conn = true;
         this->handle_one_request();
 
         // if Keep-Alive is received
         // while (!this->to_close_conn)
         //     this->handle_one_request();
-
-        this->terminate();
     }
 
     void close_conn()
@@ -125,30 +141,46 @@ struct HTTPRequest {
 
     void handle_one_request()
     {
-        log_debug("handle_one_request");
+        log_debug("handle_one_request state=%d", this->state);
 
         int ret;
-        ret = this->parse_request_line();
-        if (ret == EINVAL) {
-            // Bad Request
-            this->response_error(400);
-            return;
-        } else if (ret != 0) {
-            this->to_close_conn = true;
-            return;
-        }
 
-        ret = this->parse_request_header();
-        if (ret == EINVAL) {
-            // Bad Request
-            this->response_error(400);
-            return;
-        } else if (ret != 0) {
-            this->to_close_conn = true;
-            return;
-        }
+        switch (this->state) {
+        // fall through
+        case STATE_BEGIN:
+            ret = this->parse_request_line();
+            if (ret == EINVAL) {
+                // Bad Request
+                this->response_error(400);
+                return;
+            } else if (ret == EAGAIN || ret == EWOULDBLOCK) {
+                this->state = STATE_REQ_LINE;
+                return;
+            } else if (ret != 0) {
+                this->to_close_conn = true;
+                return;
+            }
 
-        this->do_request();
+        case STATE_REQ_LINE:
+            ret = this->parse_request_header();
+            if (ret == EINVAL) {
+                // Bad Request
+                this->response_error(400);
+                return;
+            } else if (ret == ENOSYS) {
+                // header ends
+                this->state = STATE_REQ_HDR;
+            } else if (ret == EAGAIN || ret == EWOULDBLOCK) {
+                this->state = STATE_REQ_LINE;
+                return;
+            } else if (ret != 0) {
+                this->to_close_conn = true;
+                return;
+            }
+
+        case STATE_REQ_HDR:
+            this->do_request();
+        }
     }
 
     int parse_request_line()
@@ -156,7 +188,10 @@ struct HTTPRequest {
         // TODO: what if MAX_REQUEST_LINE_LEN is reached
         if (fgets(this->buf, MAX_BUF_SIZE, this->client_read) == NULL) {
             log_err("fgets");
-            return errno;
+            if (feof(this->client_read))
+                return EINVAL;
+            else
+                return errno;
         }
 
         char *reqline = this->buf;
@@ -201,8 +236,10 @@ struct HTTPRequest {
             char *hdr = this->buf;
             log_debug("header line: %s", hdr);
 
-            if (hdr[0] == '\n' || (hdr[0] == '\r' && hdr[1] == '\n'))
-                break;
+            if (hdr[0] == '\n' || (hdr[0] == '\r' && hdr[1] == '\n')) {
+                log_debug("header end");
+                return ENOSYS;  // as an indication of header end
+            }
 
             char *key = strsep(&hdr, ":");
             if (!hdr)
@@ -292,6 +329,8 @@ struct HTTPRequest {
         fprintf(this->client_write, "\r\n");
         fwrite(content, 1, content_len, this->client_write);
         G(fflush(this->client_write));
+
+        this->terminate();
     }
 
     void response_error(int status_code)
