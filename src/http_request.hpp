@@ -45,14 +45,9 @@ struct HTTPRequest {
     const static size_t MAX_BUF_SIZE = 8192;          // 8KiB
     const static size_t MAX_REQUEST_LINE_LEN = 8192;  // 8KiB
 
-    FILE *client_fs;
+    FILE *client_read, *client_write;
     int client_fd;
     bool to_close_conn;
-    pthread_t thread;
-
-    std::list<HTTPRequest *> *zombie_queue;
-    pthread_mutex_t *zombie_lock;
-    pthread_cond_t *zombie_cond;
 
     // ring buffer
     char buf[MAX_BUF_SIZE];
@@ -70,37 +65,28 @@ struct HTTPRequest {
     // };
     // std::list<HTTPRequestHeader> header_list;
 
-    HTTPRequest(int client_fd,
-                std::list<HTTPRequest *> *zombie_queue,
-                pthread_mutex_t *zombie_lock,
-                pthread_cond_t *zombie_cond)
-        : client_fs(NULL),
-          client_fd(client_fd),
+    HTTPRequest(int client_fd, bool file_stream = true)
+        : client_fd(client_fd),
           to_close_conn(false),
-          zombie_queue(zombie_queue),
-          zombie_lock(zombie_lock),
-          zombie_cond(zombie_cond),
           http_major(0),
           http_minor(0)
     {
-        this->client_fs = fdopen(client_fd, "r+b");
-        if (!this->client_fs) {
-            log_err("fdopen(client_fd)");
+        if (file_stream) {
+            this->client_read = fdopen(client_fd, "rb");
+            this->client_write = fdopen(client_fd, "wb");
+            if (!this->client_read) {
+                log_err("fdopen(r)");
+            }
+            if (!this->client_write) {
+                log_err("fdopen(w)");
+            }
+        } else {
+            this->client_read = NULL;
+            this->client_write = NULL;
         }
-
-        method[0] = '\0';
-
-        G(pthread_create(&this->thread, NULL, this->thread_routine, this));
     }
 
     ~HTTPRequest() { this->terminate(); }
-
-    static void *thread_routine(void *self_)
-    {
-        HTTPRequest *self = (HTTPRequest *) self_;
-        self->handle();
-        return NULL;
-    }
 
     void handle()
     {
@@ -122,81 +108,23 @@ struct HTTPRequest {
         log_info("Closing connection fd=%d", client_fd);
 
         // TODO: shutdown vs. close
-        G(shutdown(this->client_fd, SHUT_RDWR));
-        // G(close(this->client_fd));
+        // G(shutdown(this->client_fd, SHUT_RDWR));
+        G(close(this->client_fd));
 
-        if (this->client_fs) {
-            G(fclose(this->client_fs));
-        }
+        // TODO: fclose after close?
+        if (this->client_read)
+            G(fclose(this->client_read));
+        if (this->client_write)
+            G(fclose(this->client_write));
         this->client_fd = -1;
-        this->client_fs = NULL;
+        this->client_read = NULL;
+        this->client_write = NULL;
     }
 
-    void terminate()
-    {
-        this->close_conn();
-
-        pthread_mutex_lock(this->zombie_lock);
-        this->zombie_queue->push_back(this);
-        pthread_cond_signal(this->zombie_cond);
-        pthread_mutex_unlock(this->zombie_lock);
-    }
+    void terminate() { this->close_conn(); }
 
     void handle_one_request()
     {
-        // for (;;) {
-        //     char *plast = &this->buf[this->write_pos % MAX_BUF_SIZE];
-        //     size_t remain_size =
-        //         std::min(MAX_BUF_SIZE - (this->write_pos - this->read_pos) -
-        //         1,
-        //                  MAX_BUF_SIZE - this->write_pos % MAX_BUF_SIZE);
-        //     int nr = read(this->client_fd, plast, remain_size);
-        //
-        //     if (nr == 0) {
-        //         // EOF
-        //         this->to_close_conn = true;
-        //         break;
-        //     }
-        //
-        //     if (nr < 0) {
-        //         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        //             log_err("recv error");
-        //             this->to_close_conn = true;
-        //         }
-        //         break;
-        //     }
-        //
-        //     this->write_pos += nr;
-        //     assert(this->write_pos - this->read_pos < MAX_BUF_SIZE &&
-        //            "Request buffer overflow!");
-        //
-        //     int ret;
-        //
-        //     ret = this->parse_request_line();
-        //     if (ret == EAGAIN) {
-        //         // request message not fully received
-        //         continue;
-        //     } else if (ret != 0) {
-        //         // error
-        //         this->to_close_conn = true;
-        //         break;
-        //     }
-        //
-        //     ret = this->parse_request_body();
-        //     if (ret == EAGAIN) {
-        //         // request message not fully received
-        //         continue;
-        //     } else if (ret != 0) {
-        //         // error
-        //         this->to_close_conn = true;
-        //         break;
-        //     }
-        //
-        //     if (this->method == "GET")
-        //         this->do_GET();
-        // }
-
-
         int ret;
         ret = this->parse_request_line();
         if (ret == EINVAL) {
@@ -208,7 +136,15 @@ struct HTTPRequest {
             return;
         }
 
-        this->parse_request_header();
+        ret = this->parse_request_header();
+        if (ret == EINVAL) {
+            // Bad Request
+            this->response_error(400);
+            return;
+        } else if (ret != 0) {
+            this->to_close_conn = true;
+            return;
+        }
 
         this->do_request();
     }
@@ -216,7 +152,7 @@ struct HTTPRequest {
     int parse_request_line()
     {
         // TODO: what if MAX_REQUEST_LINE_LEN is reached
-        if (fgets(this->buf, MAX_BUF_SIZE, this->client_fs) == NULL) {
+        if (fgets(this->buf, MAX_BUF_SIZE, this->client_read) == NULL) {
             log_err("fgets");
             return errno;
         }
@@ -249,14 +185,20 @@ struct HTTPRequest {
     {
         for (;;) {
             // TODO: what if MAX_REQUEST_LINE_LEN is reached
-            if (fgets(this->buf, MAX_BUF_SIZE, this->client_fs) == NULL) {
-                if (feof(this->client_fs))
-                    return 0;
+            if (fgets(this->buf, MAX_BUF_SIZE, this->client_read) == NULL) {
+                log_err("fgets");
+                if (feof(this->client_read))
+                    return EINVAL;
                 else
-                    return -1;
+                    return errno;
             }
 
+            size_t n = strlen(this->buf);
+            if (this->buf[n - 2] != '\r' || this->buf[n - 1] != '\n')
+                return EINVAL;
+
             log_debug("header: %s", this->buf);
+
             if (this->buf[0] == '\r' && this->buf[1] == '\n')
                 break;
         }
@@ -320,18 +262,18 @@ struct HTTPRequest {
         log_debug("response status=%d cont=%s len=%d", status_code, content,
                   content_len);
 
-        fprintf(this->client_fs, "HTTP/1.0 ");
-        fprintf(this->client_fs,
+        fprintf(this->client_write, "HTTP/1.0 ");
+        fprintf(this->client_write,
                 (status_code == 200
                      ? "200 OK"
                      : status_code == 404 ? "404 Not Found"
                                           : "500 Internal Server Error"));
-        fprintf(this->client_fs, "\r\n");
-        fprintf(this->client_fs, "Content-Length: %lu\r\n", content_len);
-        fprintf(this->client_fs, "Connection: Close\r\n");
-        fprintf(this->client_fs, "\r\n");
-        fwrite(content, 1, content_len, this->client_fs);
-        G(fflush(this->client_fs));
+        fprintf(this->client_write, "\r\n");
+        fprintf(this->client_write, "Content-Length: %lu\r\n", content_len);
+        fprintf(this->client_write, "Connection: Close\r\n");
+        fprintf(this->client_write, "\r\n");
+        fwrite(content, 1, content_len, this->client_write);
+        G(fflush(this->client_write));
 
         this->to_close_conn = true;
     }

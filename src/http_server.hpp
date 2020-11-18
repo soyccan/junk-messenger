@@ -5,10 +5,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <poll.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <signal.h>
+#include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -40,21 +37,13 @@ static inline int sock_set_non_blocking(int fd)
 
 struct HTTPServer {
     int listen_fd;
-    pthread_t listen_thread;
-
     bool to_shutdown;
-    sem_t is_shutdown;
 
-    std::list<HTTPRequest> request_list;
-    std::list<HTTPRequest *> zombie_queue;
-    pthread_mutex_t zombie_lock;
-    pthread_cond_t zombie_cond;
+    int epoll_fd;
 
     HTTPServer(in_port_t port = 80, std::string addr = "127.0.0.1")
         : to_shutdown(false)
     {
-        log_info("Web server started");
-
 #ifdef __MACH__  // macOS
         this->listen_fd = socket(PF_INET, SOCK_STREAM, 0);
 #else
@@ -74,42 +63,64 @@ struct HTTPServer {
         G(bind(this->listen_fd, (struct sockaddr *) &bind_addr,
                sizeof(bind_addr)));
         G(listen(this->listen_fd, SOMAXCONN));
-        // G(sock_set_non_blocking(this->listen_fd));
+        G(sock_set_non_blocking(this->listen_fd));
 
-        G(sem_init(&this->is_shutdown, 0, 0));
-        G(pthread_mutex_init(&this->zombie_lock, NULL));
-        G(pthread_cond_init(&this->zombie_cond, NULL));
-    }
 
-    static void *listen_thread_loop(void *self_)
-    {
-        HTTPServer *self = (HTTPServer *) self_;
-        while (!self->to_shutdown) {
-            self->accept_request();
-        }
-        // G(sem_post(&self->is_shutdown));
-        return NULL;
+        // epoll
+        G(this->epoll_fd = epoll_create1(0));
+
+        // this is not a real request, just for placed in epoll event list
+        HTTPRequest *dummy = new HTTPRequest(this->listen_fd, false);
+        struct epoll_event ev;
+        ev.data.ptr = dummy;
+        ev.events = EPOLLIN | EPOLLET;
+        G(epoll_ctl(this->epoll_fd, EPOLL_CTL_ADD, this->listen_fd, &ev));
+
+
+        log_info("Web server started");
     }
 
     void serve_forever()
     {
-        int ret;
-        ret = pthread_create(&this->listen_thread, NULL,
-                             this->listen_thread_loop, this);
-        if (ret < 0) {
-            log_err("pthread_create");
-            return;
-        }
+        const static size_t MAX_EVENT = 1024;
+        struct epoll_event events[MAX_EVENT] = {};
 
         while (!this->to_shutdown) {
-            pthread_mutex_lock(&this->zombie_lock);
-            while (this->zombie_queue.empty()) {
-                pthread_cond_wait(&this->zombie_cond, &this->zombie_lock);
-            }
-            pthread_mutex_unlock(&this->zombie_lock);
-        }
+            log_debug("epoll");
 
-        G(pthread_join(this->listen_thread, NULL));
+            int n_event = epoll_wait(this->epoll_fd, events, MAX_EVENT, -1);
+
+            if (n_event < 0) {
+                log_err("epoll_wait");
+                continue;
+            }
+
+            for (struct epoll_event *ev = events; ev < events + n_event; ev++) {
+                HTTPRequest *rq = (HTTPRequest *) ev->data.ptr;
+                if (rq->client_fd == this->listen_fd) {
+                    // listening socket has events
+                    if (ev->events & EPOLLIN) {
+                        do
+                            ;
+                        while (this->accept_request() > 0);
+                    } else {
+                        log_info("listening fd has unknown event: %d",
+                                 ev->events);
+                    }
+                } else {
+                    // client socket has events
+                    if ((ev->events & EPOLLERR) || (ev->events & EPOLLHUP) ||
+                        !(ev->events & EPOLLIN)) {
+                        log_err("epoll error fd: %d", rq->client_fd);
+                        G(epoll_ctl(this->epoll_fd, EPOLL_CTL_DEL,
+                                    rq->client_fd, ev));
+                        delete rq;
+                    } else {
+                        ((HTTPRequest *) ev->data.ptr)->handle();
+                    }
+                }
+            }
+        }
     }
 
     void shutdown()
@@ -117,7 +128,6 @@ struct HTTPServer {
         this->to_shutdown = true;
 
         log_info("Waiting thread to terminate");
-        pthread_kill(this->listen_thread, SIGINT);
         // G(sem_wait(&this->is_shutdown));
 
         log_info("Closing socket");
@@ -131,8 +141,8 @@ struct HTTPServer {
      */
     int accept_request()
     {
-        struct sockaddr_in in_addr = {0};
-        socklen_t in_addr_len = 0;
+        struct sockaddr_in in_addr;
+        socklen_t in_addr_len = sizeof(struct sockaddr_in);
 
         int in_fd =
             accept(this->listen_fd, (struct sockaddr *) &in_addr, &in_addr_len);
@@ -150,39 +160,16 @@ struct HTTPServer {
         log_info("accepted fd=%d addr=%s port=%d", in_fd,
                  inet_ntoa(in_addr.sin_addr), in_addr.sin_port);
 
-        // TODO: non-blockng IO
-        // G(sock_set_non_blocking(in_fd));
+        G(sock_set_non_blocking(in_fd));
 
-        this->request_list.emplace_back(in_fd, &this->zombie_queue,
-                                        &this->zombie_lock, &this->zombie_cond);
-        auto &request = this->request_list.back();
-        request.handle();
+        HTTPRequest *rq = new HTTPRequest(in_fd);
+        struct epoll_event ev;
+        ev.data.ptr = rq;
+        ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        G(epoll_ctl(this->epoll_fd, EPOLL_CTL_ADD, in_fd, &ev));
 
         return 1;
     }
-
-    // void close_request(int fd)
-    // {
-    //     for (auto r = this->request_list.begin(); r !=
-    //     this->request_list.end();
-    //          r++) {
-    //         if (r->client_fd == fd) {
-    //             this->request_list.erase(r);
-    //             break;
-    //         }
-    //     }
-    // }
-    //
-    // int handle_request_noblock(int fd)
-    // {
-    //     for (HTTPRequest &r : this->request_list) {
-    //         if (r.client_fd == fd) {
-    //             r.handle();
-    //             break;
-    //         }
-    //     }
-    //     return 0;
-    // }
 };
 
 #endif
