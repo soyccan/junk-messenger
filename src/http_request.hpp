@@ -125,6 +125,8 @@ struct HTTPRequest {
 
     void handle_one_request()
     {
+        log_debug("handle_one_request");
+
         int ret;
         ret = this->parse_request_line();
         if (ret == EINVAL) {
@@ -161,11 +163,14 @@ struct HTTPRequest {
         log_debug("Request: %s", reqline);
 
         char *method = strsep(&reqline, " ");
+        if (!reqline)
+            return EINVAL;
         char *query_str = strsep(&reqline, " ");
+        if (!reqline)
+            return EINVAL;
         char *http_version = strsep(&reqline, "\r\n");
 
-        if (!method || !query_str || !http_version ||
-            !streq32(http_version, 'H', 'T', 'T', 'P') ||
+        if (!reqline || !streq32(http_version, 'H', 'T', 'T', 'P') ||
             http_version[4] != '/' || http_version[6] != '.') {
             return EINVAL;
         }
@@ -193,14 +198,27 @@ struct HTTPRequest {
                     return errno;
             }
 
-            size_t n = strlen(this->buf);
-            if (this->buf[n - 2] != '\r' || this->buf[n - 1] != '\n')
+            char *hdr = this->buf;
+            log_debug("header line: %s", hdr);
+
+            if (hdr[0] == '\n' || (hdr[0] == '\r' && hdr[1] == '\n'))
+                break;
+
+            char *key = strsep(&hdr, ":");
+            if (!hdr)
+                return EINVAL;
+            hdr++;
+            char *value = strsep(&hdr, "\r\n");
+            if (!hdr)
                 return EINVAL;
 
-            log_debug("header: %s", this->buf);
+            log_debug("Header field (%s) = (%s)", key, value);
 
-            if (this->buf[0] == '\r' && this->buf[1] == '\n')
-                break;
+            if (strcasecmp(key, "connection") == 0 &&
+                strcasecmp(value, "keep-alive") == 0) {
+                log_debug("keep-alive");
+                this->to_close_conn = false;
+            }
         }
 
         return 0;
@@ -274,8 +292,6 @@ struct HTTPRequest {
         fprintf(this->client_write, "\r\n");
         fwrite(content, 1, content_len, this->client_write);
         G(fflush(this->client_write));
-
-        this->to_close_conn = true;
     }
 
     void response_error(int status_code)

@@ -158,7 +158,7 @@ struct HTTPServer {
         }
 
         log_info("accepted fd=%d addr=%s port=%d", in_fd,
-                 inet_ntoa(in_addr.sin_addr), in_addr.sin_port);
+                 inet_ntoa(in_addr.sin_addr), ntohs(in_addr.sin_port));
 
         G(sock_set_non_blocking(in_fd));
 
