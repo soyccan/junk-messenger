@@ -1,0 +1,7 @@
+version: "3"
+services:
+    junk-messenger:
+        build: .
+        hostname: "junk-messenger"
+        ports: 
+            - "8081:8081"
