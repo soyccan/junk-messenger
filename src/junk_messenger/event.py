@@ -31,6 +31,7 @@ DEFAULT_BODY = '''
 <footer>
     <p>Author: soyccan (B07902143)</p>
     <p>Project Stage 2 of Computer Networking, 2020 Fall, NTU</p>
+    <img src="https://4kwallpapers.com/images/wallpapers/macos-big-sur-apple-layers-fluidic-colorful-wwdc-stock-2020-4096x2304-1455.jpg">
 </footer>
 </html>
 '''

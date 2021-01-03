@@ -4,15 +4,57 @@ import os
 import json
 import queue
 import shutil
+import ssl
 import sys
 import urllib.parse
 import threading
 import io
+import socketserver
+import socket
 
 import junk_messenger as jm
 
 
-class JunkServer(http.server.ThreadingHTTPServer):
+class JunkTCPServer(socketserver.TCPServer):
+    """ Support HTTPS """
+    USE_SSL = True
+    CERT_PATH = 'pki/issued/CN PROJECT.crt'
+    PRI_KEY_PATH = 'pki/private/CN PROJECT.key'
+
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
+        """Constructor.  May be extended, do not override."""
+        super().__init__(server_address, RequestHandlerClass)
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.CERT_PATH, self.PRI_KEY_PATH)
+        self.socket = socket.socket(self.address_family,
+                                    self.socket_type)
+        if bind_and_activate:
+            try:
+                self.server_bind()
+                self.server_activate()
+                if self.USE_SSL:
+                    self.socket = context.wrap_socket(self.socket, server_side=True)
+            except:
+                self.server_close()
+                raise
+
+
+class JunkHTTPServer(JunkTCPServer):
+
+    allow_reuse_address = 1    # Seems to make sense in testing environment
+
+    def server_bind(self):
+        """Override server_bind to store the server name."""
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = socket.getfqdn(host)
+        self.server_port = port
+
+
+class JunkThreadingHTTPServer(socketserver.ThreadingMixIn, JunkHTTPServer):
+    daemon_threads = True
+
     def __init__(self, server_address, RequestHandlerClass):
         super().__init__(server_address, RequestHandlerClass)
 
@@ -21,7 +63,10 @@ class JunkServer(http.server.ThreadingHTTPServer):
         self.post_manager = jm.PostManager()
 
 
-class JunkHttpRequestHandler(http.server.SimpleHTTPRequestHandler):
+class JunkHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    # Set this to HTTP/1.1 to enable automatic keepalive
+    protocol_version = "HTTP/1.1"
+
     def __init__(self, *args, **kwargs):
         self.query = None
         self.account = None
@@ -137,9 +182,8 @@ class JunkHttpRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.account = self.server.account_manager.get(self.session.acct_id)
 
 
-
 def main():
-    svr = JunkServer(('127.0.0.1', int(sys.argv[1])), JunkHttpRequestHandler)
+    svr = JunkThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), JunkHTTPRequestHandler)
     print('Start server')
     svr.serve_forever()
 
