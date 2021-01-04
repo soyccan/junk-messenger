@@ -23,6 +23,6 @@ def recvall(sock, n):
     while buf.tell() < n:
         packet = sock.recv(n - buf.tell())
         if not packet:
-            return None
+            break
         buf.write(packet)
     return buf.getbuffer().tobytes()

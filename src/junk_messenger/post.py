@@ -4,7 +4,6 @@ import sys
 
 import junk_messenger as jm
 
-
 Post = collections.namedtuple('Post', ['author', 'content', 'title', 'id'])
 
 

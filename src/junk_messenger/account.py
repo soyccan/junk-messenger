@@ -1,10 +1,8 @@
 import collections
 import pickle
-import hashlib
 import sys
 
 import junk_messenger as jm
-
 
 Account = collections.namedtuple('Account', ['id', 'username', 'password'])
 
@@ -52,6 +50,9 @@ class AccountManager:
 
     def get(self, account_id):
         return self.accounts_by_id.get(account_id)
+
+    def get_by_name(self, name):
+        return self.accounts_by_username.get(name)
 
     def __len__(self):
         return len(self.accounts_by_id)

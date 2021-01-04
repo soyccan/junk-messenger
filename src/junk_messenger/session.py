@@ -1,4 +1,3 @@
-import collections
 import random
 from dataclasses import dataclass
 

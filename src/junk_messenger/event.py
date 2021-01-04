@@ -1,6 +1,12 @@
 import http
 import io
-import shutil
+import os
+import struct
+import sys
+import threading
+import urllib.parse
+
+import cv2
 
 import junk_messenger as jm
 
@@ -114,16 +120,6 @@ class DefaultEvent(BaseEvent):
                                    redirect_msg=redirect_msg,
                                    posts=buf.getvalue().decode())
         self.reqhdlr.send_message(body)
-
-
-# class RenderFileEvent(BaseEvent):
-#     def handle(self):
-#         f = self.reqhdlr.send_head()
-#         if f:
-#             try:
-#                 self.reqhdlr.copyfile(f, self.reqhdlr.wfile)
-#             finally:
-#                 f.close()
 
 
 class LoginEvent(BaseEvent):
@@ -245,3 +241,79 @@ class CreateAccountEvent(BaseEvent):
 
     def fail(self, message):
         self.reqhdlr.redirect_to_home('Fail to create account: ' + message)
+
+
+class PlayEvent(BaseEvent):
+    def handle(self):
+        cap = cv2.VideoCapture(0)
+        while True:
+            status, frame = cap.read()
+            arr = frame #.to_ndarray()
+            msg = struct.pack('>3I', *arr.shape) + arr.tobytes()
+            try:
+                jm.utils.send(self.reqhdlr.request, msg)
+            except:
+                print(sys.exc_info())
+                break
+        cap.release()
+
+        return
+
+        path = urllib.parse.urlsplit(self.reqhdlr.path).path.split('/')
+        if not path[2:] or not path[2]:
+            # restart streaming such that the client won't suffer delay
+            self.reqhdlr.server.stop_streaming()
+            self.reqhdlr.server.start_streaming()
+
+            self.reqhdlr.send_response(http.HTTPStatus.TEMPORARY_REDIRECT)
+            self.reqhdlr.send_header('Location', '/play/stream.m3u8')
+            self.reqhdlr.send_header("Content-Length", '0')
+            self.reqhdlr.end_headers()
+
+        f = self.reqhdlr.send_head()
+        if f:
+            try:
+                self.reqhdlr.copyfile(f, self.reqhdlr.wfile)
+            finally:
+                f.close()
+
+        # query = self.reqhdlr.query
+        # peername = query.get(b'peername')
+        # segid = query.get(b'segid')
+        # if not peername or not segid:
+        #     self.fail('Invalid peername or segid')
+        #     return
+        # peername = peername[0]
+        # segid = segid[0]
+        #
+        # peeracct = self.reqhdlr.server.account_manager.get_by_name(peername)
+        # if not peeracct:
+        #     self.fail('Invalid peername')
+        #     return
+        # peerid = peeracct.id
+        #
+        # if segid == b'm3u8':
+        #     self.reqhdlr.send_message('', mimetype='application/x-mpegURL')
+        # else:
+        #     segfilename = os.path.join(jm.TS_PATH, str(peerid), segid.decode()+'.ts')
+        #     try:
+        #         segfile = open(segfilename, 'rb')
+        #         segsz = os.stat(segfilename).st_size
+        #     except FileNotFoundError:
+        #         self.fail('Seg not found')
+        #         return
+        #
+        #     self.reqhdlr.send_fileobj(segfile, segsz, mimetype='video/MP2T')
+
+    def fail(self, msg):
+        self.reqhdlr.redirect_to_home('Fail to receive call: ' + msg)
+
+
+# class StreamEvent(BaseEvent):
+#     def handle(self):
+#         if not self.streamer_lock.acquire(blocking=False):
+#             self.reqhdlr.redirect_to_home('The streaming room is occupied')
+#             return
+#
+#         self.streamer_lock.release()
+#         self.reqhdlr.redirect_to_home('Streaming finished')
