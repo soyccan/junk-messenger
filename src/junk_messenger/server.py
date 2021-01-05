@@ -20,7 +20,7 @@ import junk_messenger as jm
 
 class JunkTCPServer(socketserver.TCPServer):
     """ Support HTTPS """
-    USE_SSL = False
+    USE_SSL = True
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         """Constructor.  May be extended, do not override."""
@@ -64,40 +64,48 @@ class JunkThreadingHTTPServer(socketserver.ThreadingMixIn, JunkHTTPServer):
         self.post_manager = jm.PostManager()
 
         self.stream_proc = None
+        self.stream_thread = None
 
     def __del__(self):
         self.stop_streaming()
 
+    def run_streaming(self):
+        cmd = [jm.FFMPEG_BIN,
+               '-y',
+               '-f', 'avfoundation',
+               '-framerate', '30',
+               '-i', '0',
+               '-c:v', 'libx264',
+               '-c:a', 'aac',
+               '-tune', 'zerolatency',
+               '-bf', '1',
+               '-keyint_min', '25',
+               '-g', '250',
+               '-sc_threshold', '40',
+               '-hls_list_size', '10',
+               '-hls_time', '5',
+               '-hls_allow_cache', '1',
+               '-hls_segment_filename', 'play/stream_%04d.ts',
+               '-hls_fmp4_init_filename', 'stream_init.mp4',
+               '-s:v', '854x480',
+               '-b:v', '750k',
+               '-b:a', '192k',
+               '-strict', '-2',
+               '-hls_flags', 'delete_segments',
+               'play/stream.m3u8']
+        self.stream_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def start_streaming(self):
-        pass
-        # cmd = [jm.FFMPEG_BIN,
-        #        '-y',
-        #        '-f', 'avfoundation',
-        #        '-framerate', '30',
-        #        '-i', '0',
-        #        '-c:v', 'libx264',
-        #        '-c:a', 'aac',
-        #        '-tune', 'zerolatency',
-        #        '-bf', '1',
-        #        '-keyint_min', '25',
-        #        '-g', '250',
-        #        '-sc_threshold', '40',
-        #        '-hls_list_size', '10',
-        #        '-hls_time', '5',
-        #        '-hls_allow_cache', '1',
-        #        '-hls_segment_filename', 'play/stream_%04d.ts',
-        #        '-hls_fmp4_init_filename', 'stream_init.mp4',
-        #        '-s:v', '854x480',
-        #        '-b:v', '750k',
-        #        '-b:a', '192k',
-        #        '-strict', '-2',
-        #        '-hls_flags', 'delete_segments',
-        #        'play/stream.m3u8']
-        # self.stream_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        #
-        # while not os.path.exists('play/stream.m3u8'):
-        #     time.sleep(1)
-        #     pass
+        try:
+            os.remove('play/stream.m3u8')
+        except:
+            pass
+
+        self.stream_thread = threading.Thread(target=self.run_streaming())
+        self.stream_thread.run()
+
+        while not os.path.exists('play/stream.m3u8'):
+            time.sleep(1)
 
         # _480p = ffstream.Representation(ffstream.Size(854, 480),
         #                                 ffstream.Bitrate(750 * 1024, 192 * 1024))
@@ -119,7 +127,10 @@ class JunkThreadingHTTPServer(socketserver.ThreadingMixIn, JunkHTTPServer):
         #     os.kill(self.stream_proc.pid, signal.SIGTERM)
         #     os.waitpid(self.stream_proc.pid, 0)
         #     self.stream_proc = None
-        #     os.remove('play/stream.m3u8')
+        #     try:
+        #         os.remove('play/stream.m3u8')
+        #     except:
+        #         pass
 
 
 class JunkHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
