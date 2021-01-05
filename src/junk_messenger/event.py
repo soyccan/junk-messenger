@@ -147,6 +147,7 @@ class LoginEvent(BaseEvent):
 class LogoutEvent(BaseEvent):
     def handle(self):
         self.reqhdlr.server.session_manager.logout(self.reqhdlr.session.sess_id)
+        self.reqhdlr.account = None
         self.reqhdlr.redirect_to_home('')
 
 # class ListPostsEvent(BaseEvent):
